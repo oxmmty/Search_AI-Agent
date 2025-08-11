@@ -1,0 +1,66 @@
+{
+  "containerDefinitions": [
+      {
+          "name": "instacoin-webapi",
+          "image": "253091223802.dkr.ecr.us-west-2.amazonaws.com/instacoin-webapi:latest",
+          "cpu": 0,
+          "portMappings": [
+              {
+                  "name": "3000",
+                  "containerPort": 3000,
+                  "hostPort": 3000,
+                  "protocol": "tcp"
+              }
+          ],
+          "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-create-group": "true",
+                "awslogs-group": "instacoin-prod",
+                "awslogs-region": "us-west-2",
+                "awslogs-stream-prefix": "instacoin-prod-api"
+            }
+        },
+          "essential": true,
+          "environment": [],
+          "mountPoints": [],
+          "volumesFrom": [],
+          "systemControls": []
+      }
+  ],
+  "family": "instacoin-webapi",
+  "executionRoleArn": "arn:aws:iam::253091223802:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "revision": 8,
+  "volumes": [],
+  "status": "ACTIVE",
+  "requiresAttributes": [
+      {
+          "name": "com.amazonaws.ecs.capability.ecr-auth"
+      },
+      {
+          "name": "ecs.capability.execution-role-ecr-pull"
+      },
+      {
+          "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+      },
+      {
+          "name": "ecs.capability.task-eni"
+      }
+  ],
+  "placementConstraints": [],
+  "compatibilities": [
+      "EC2",
+      "FARGATE"
+  ],
+  "requiresCompatibilities": [
+      "FARGATE"
+  ],
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": {
+      "cpuArchitecture": "X86_64",
+      "operatingSystemFamily": "LINUX"
+  },
+  "tags": []
+}
