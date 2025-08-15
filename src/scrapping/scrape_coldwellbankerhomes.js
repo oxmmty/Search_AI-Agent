@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { z } = require('zod');
@@ -6,20 +8,20 @@ const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords')
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
-const BASE_URL = "https://www.redfin.com";
+const BASE_URL = "https://www.coldwellbankerhomes.com";
 const CITY_PATHS = [
-  "/city/12766/GA/Marietta",
-  "/city/10991/GA/Kennesaw",
-  "/city/17232/GA/Roswell",
-  "/city/438/GA/Alpharetta",
-  "/city/33985/GA/Milton",
-  "/city/17553/GA/Sandy-Springs",
-  "/city/22699/GA/Dunwoody",
-  "/city/3026/GA/Buckhead",
-  "/city/35852/GA/Brookhaven",
-  "/city/33537/GA/Johns-Creek",
-  "/city/20749/GA/Woodstock",
-  "/city/26520/GA/Vinings"
+  "/ga/marietta",
+  "/ga/kennesaw",
+  "/ga/roswell",
+  "/ga/alpharetta",
+  "/ga/milton",
+  "/ga/sandy-springs",
+  "/ga/dunwoody",
+  "/ga/buckhead",
+  "/ga/brookhaven",
+  "/ga/johns-creek",
+  "/ga/woodstock",
+  "/ga/vinings"
 ];
 
 
@@ -32,7 +34,7 @@ const TAG_CONCURRENCY = 4;
 
 const HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
-  "Referer": "https://www.redfin.com/",
+  "Referer": "https://www.coldwellbankerhomes.com/",
   "Accept-Encoding": "gzip, deflate, br, zstd",
   "Priority": "u=0, i",
   "Sec-Ch-Ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
@@ -62,40 +64,105 @@ function joinUrl(base, href) {
   return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
 }
 
-/** build Redfin search URL like /city/.../filter/remarks=... */
+/** 
+ * https://www.coldwellbankerhomes.com/ga/marietta/keyw-investor/
+ * */
 function buildRemarkUrl(cityPath, remark, page) {
-  return `${BASE_URL}${cityPath.replace(/\/$/, "")}/filter/remarks=${encodeURIComponent(remark)}${page>1 ? `/page-${page}` :''}`;
+  return `${BASE_URL}${cityPath.replace(/\/$/, "")}/keyw-${encodeURIComponent(remark)}${page>1 ? `?sortId=${page}&offset=${24*(page-1)}` : ''}`;
 }
 
 /* ===================== PARSING ===================== */
 
 function parseCard($, card) {
   const c = $(card);
-  const item = c.find(".MapHomeCardReact.MapHomeCard > a").first();
-  const href = item.attr("href") || "";
-  const link = joinUrl(BASE_URL, href);
-  const image_url = c.find(".bp-Homecard__Photo--image").first().attr("src") ?? null;
-  const priceText = c.find(".bp-Homecard__Price--value").first().text().trim() || null;
-  const price = cleanNum(priceText);
-  const address = c.find(".bp-Homecard__Address").first().text().trim() || null;
-  const bedsText = c.find(".bp-Homecard__Stats--beds").first().text().trim() || null;
-  const bathsText = c.find(".bp-Homecard__Stats--baths").first().text().trim() || null;
-  const beds = cleanNum(bedsText);
-  const baths = cleanNum(bathsText);
-  const sqftText = c.find(".bp-Homecard__LockedStat--value").first().text().trim() || null;
-  const sqft = cleanNum(sqftText);
 
-  const remarks = c.find(".ListingRemarks, .marketingRemarks, [data-rf-test-id='listingRemarks']").first();
-  let description = null;
-  if (remarks.length) {
-    const ps = remarks.find("p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-    description = (ps.length ? ps.join(" ") : remarks.text()).replace(/\s+/g, " ").trim() || null;
-  } else {
-    description = c.attr("aria-label") || null;
+  // ---- LINK ----
+  const linkHref =
+    c.attr('data-detailurl') ||
+    c.find('.prop-pix a[href]').first().attr('href') ||
+    c.find('.prop-info .address a[href]').first().attr('href') ||
+    '';
+  const link = joinUrl(BASE_URL, linkHref);
+
+  // ---- IMAGE ----
+  const pickFromSrcset = (srcset) => {
+    if (!srcset) return null;
+    const best = srcset
+      .split(',')
+      .map(s => s.trim())
+      .map(s => {
+        const [url, size] = s.split(/\s+/);
+        // take numeric width/descriptors as scale; fallback to 1
+        const scale = parseFloat((size || '').replace(/[^\d.]/g, '')) || 1;
+        return { url, scale };
+      })
+      .sort((a, b) => b.scale - a.scale)[0];
+    return best?.url || null;
+  };
+  const isPlaceholder = (u) => !u || /spacer|1\.gif|not-available/i.test(u);
+
+  let image_url = null;
+  const imgEls = c.find('.photo-listing img').toArray();
+  for (const el of imgEls) {
+    const node = $(el);
+    const candidates = [
+      node.attr('data-src-psr'),
+      node.attr('data-src'),
+      node.attr('src'),
+      pickFromSrcset(node.attr('data-srcset-psr')),
+      pickFromSrcset(node.attr('data-srcset')),
+      pickFromSrcset(node.attr('srcset')),
+    ].filter(Boolean);
+    const chosen = candidates.find(u => !isPlaceholder(u));
+    if (chosen) {
+      image_url = chosen;
+      break;
+    }
   }
+  if (image_url && image_url.startsWith('//')) image_url = 'https:' + image_url;
+  if (image_url) image_url = joinUrl(BASE_URL, image_url);
 
-  return {
-    image_url,
+  // ---- PRICE ----
+  const priceText =
+    (c.find('.price .price-normal, .price-block .price-normal, .price .price, .price-block .price')
+      .first()
+      .text() || '')
+      .trim() || null;
+  const price = cleanNum(priceText);
+
+  // ---- ADDRESS ----
+  const address =
+    (c.find('.address .address-price-heading').first().text() || '')
+      .replace(/\s+/g, ' ')
+      .trim() || null;
+
+  // ---- STATS (beds, baths, sqft) ----
+  let beds = null, baths = null, sqft = null;
+
+  const bedsVal = (c.find('.description-highlights .highlights li.beds .val').first().text() || '').trim();
+  if (bedsVal) beds = cleanNum(bedsVal);
+
+  const bathsTotalVal = (c.find('.description-highlights .highlights li.total-bath .val').first().text() || '').trim();
+  const bathsFullVal = (c.find('.description-highlights .highlights li.full-bath .val').first().text() || '').trim();
+  if (bathsTotalVal) baths = cleanNum(bathsTotalVal);
+  else if (bathsFullVal) baths = cleanNum(bathsFullVal);
+
+  // Sq Ft might appear in different lists; scan likely containers
+  c.find('.description-highlights .highlights li, .description-summary li, .address-price-etc, .prop-info')
+    .each((_, li) => {
+      if (sqft != null) return;
+      const t = ($(li).text() || '').trim();
+      if (/(sq\.?\s*ft|square\s*feet)/i.test(t)) {
+        const n = cleanNum(t);
+        if (n) sqft = n;
+      }
+    });
+
+  // No description on card in this layout; fetch from detail page
+  const description = null;
+
+  const result = {
+    image_url: image_url || null,
     address,
     price,
     beds,
@@ -105,16 +172,22 @@ function parseCard($, card) {
     description,
     sources: undefined,
   };
+
+  // Optional: keep your debug log
+  // console.log(result);
+
+  return result;
 }
 
 function parseSearchHtml(html) {
   const $ = cheerio.load(html);
   const results = [];
-  const containers = $(".HomeViews .HomeCardsContainer, .NearbyResults .HomeCardsContainer");
+  const cards = $(".search-list .property-snapshot-psr-panel");
 
-  containers.each((_, container) => {
-    const cards = $(container).find('[data-rf-test-name="mapHomeCard"]');
-    cards.each((__, card) => { const listing = parseCard($, card); results.push(listing); });
+  // console.log(`cards length is = `+cards.length);
+  cards.each((_, card) => {
+    const listing = parseCard($, card);
+    results.push(listing);
   });
 
   return results;
@@ -122,23 +195,69 @@ function parseSearchHtml(html) {
 
 function extractRemarksFromHtml(html) {
   const $ = cheerio.load(html);
-  const candidates = [
-    ".remarksContainer .remarks",
-    "#marketingRemarks-preview .remarks",
-    ".marketingRemarks .remarks",
-    "[data-rf-test-id='listingRemarks'] .remarks",
-    "[data-rf-test-id='listingRemarks']",
-    ".remarksContainer",
-  ];
-  for (const sel of candidates) {
-    const el = $(sel).first();
-    if (el && el.length) {
-      const text = el.text().replace(/\s+/g, " ").trim();
-      if (text) return text;
+  const clean = (s = '') => s.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+
+  const safeParse = (txt) => {
+    if (!txt) return null;
+    try {
+      return JSON.parse(txt);
+    } catch {
+      try {
+        return JSON.parse(txt.replace(/[\u2028\u2029]/g, ''));
+      } catch {
+        return null;
+      }
+    }
+  };
+
+  const getTypes = (node) => {
+    if (!node) return [];
+    const t = node['@type'];
+    if (!t) return [];
+    return Array.isArray(t) ? t.map(String) : [String(t)];
+  };
+
+  const pickDescFromNode = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    if (typeof node.description === 'string' && clean(node.description)) return clean(node.description);
+    if (node.mainEntity && typeof node.mainEntity.description === 'string' && clean(node.mainEntity.description)) {
+      return clean(node.mainEntity.description);
+    }
+    return null;
+  };
+
+  const scripts = $('script[type="application/ld+json"]').toArray()
+    .map(s => $(s).contents().text())
+    .filter(txt => /"@graph"\s*:/.test(txt || ''));
+
+  for (const raw of scripts) {
+    const data = safeParse(raw);
+    if (!data || !data['@graph']) continue;
+
+    const graph = Array.isArray(data['@graph']) ? data['@graph'] : [data['@graph']];
+
+    for (const node of graph) {
+      const types = getTypes(node).map(t => t.toLowerCase());
+      if (types.includes('realestatelisting')) {
+        const d = pickDescFromNode(node);
+        if (d) return d;
+      }
+    }
+
+    for (const node of graph) {
+      const types = getTypes(node).map(t => t.toLowerCase());
+      if (types.includes('product')) {
+        const d = pickDescFromNode(node);
+        if (d) return d;
+      }
+    }
+
+    for (const node of graph) {
+      const d = pickDescFromNode(node);
+      if (d) return d;
     }
   }
-  const ps = $(".remarksContainer p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-  if (ps.length) return ps.join(" ");
+
   return null;
 }
 
@@ -156,7 +275,7 @@ async function fetchListingDescription(context, link) {
   const page = await context.newPage();
   try {
     await page.goto(link, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".remarksContainer, [data-rf-test-id='listingRemarks'], .marketingRemarks", { timeout: 15_000 }).catch(() => {});
+    await page.waitForSelector("p[data-testid='d-listing-remarks']", { timeout: 15_000 }).catch(() => {});
     const html = await page.content();
     return extractRemarksFromHtml(html);
   } catch (e) {
@@ -283,20 +402,19 @@ async function tagListing(item) {
 
 function getPageNumber(html){
   const $ = cheerio.load(html);
-  const pages = $('.PageNumbers .ButtonLabel');
+  const nums = $('ul.propertysearch-results-pager li')
+    .toArray()
+    .map(li => $(li).text().trim())
+    .filter(t => /^\d+$/.test(t));
 
-  if (pages.length === 0) {
-    return 0;
-  }
-
-  return parseInt(pages.last().text().trim(), 10) || 0;
+  return nums.length ? parseInt(nums[nums.length - 1], 10) : 0; // last numeric page
 }
 
 async function scrapeSearchPage(context, searchUrl) {
   const page = await context.newPage();
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
+    await page.waitForSelector(".search-list .property-snapshot-psr-panel", { timeout: 45_000 });
     await autoScroll(page);
 
     const html = await page.content();
@@ -314,14 +432,16 @@ async function scrapeSearchPages(context, city, term) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
+    // console.log('before waiting');
+    await page.waitForSelector(".search-list .property-snapshot-psr-panel", { timeout: 45_000 });
+    // console.log('after waiting');
     await autoScroll(page);
 
     const html = await page.content();
     const lastPage = getPageNumber(html);
+    // console.log(`url=${url}, pages=${lastPage}`)
     const listings = parseSearchHtml(html);
 
-    console.log(`url=${url}, pages=${lastPage}`)
     for(let i = 2; i <= lastPage; i++){
       const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
       listings.concat(results);
@@ -353,6 +473,7 @@ async function scrapeAndTagAll(cityPath, terms) {
     // 1) build search URLs for all terms
     const searchInfo = terms.map(t => ({ term: t, city: cityPath }));
     console.log(`Searching ${searchInfo.length} queries...`);
+    console.log(searchInfo);
 
     // 2) scrape each search page
     const pagesListings = await runWithConcurrency(searchInfo, 3, async ({ term, city }) => {
@@ -360,6 +481,8 @@ async function scrapeAndTagAll(cityPath, terms) {
       // attach source term to each
       return results.map(r => ({ ...r, sources: [term] }));
     });
+
+    // console.log(pagesListings);
 
     // 3) aggregate + dedupe by link
     const byLink = new Map();
@@ -397,14 +520,13 @@ async function scrapeAndTagAll(cityPath, terms) {
 
 /* ===================== RUN (example) ===================== */
 
-async function scrapeRedfin() {
+async function scrapeColdwellbankerhomes() {
   // Build combined terms: damage + sale-types
   const TERMS = ["damage", ...SALE_TYPE_KEYWORDS];
   const results = [];
 
   for (const CITY_PATH of CITY_PATHS) {
     const data = await scrapeAndTagAll(CITY_PATH, TERMS);
-    
     const uniqueByAddress = Array.from(
       new Map(data.map(item => [item.address, item])).values()
     );
@@ -416,4 +538,4 @@ async function scrapeRedfin() {
   console.log(`\nKept ${results.length} listings with ≥1 matching keyword.`);
 }
 
-module.exports = { scrapeRedfin };
+module.exports = { scrapeColdwellbankerhomes };

@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { z } = require('zod');
@@ -6,33 +8,32 @@ const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords')
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
-const BASE_URL = "https://www.redfin.com";
+const BASE_URL = "https://www.movoto.com";
 const CITY_PATHS = [
-  "/city/12766/GA/Marietta",
-  "/city/10991/GA/Kennesaw",
-  "/city/17232/GA/Roswell",
-  "/city/438/GA/Alpharetta",
-  "/city/33985/GA/Milton",
-  "/city/17553/GA/Sandy-Springs",
-  "/city/22699/GA/Dunwoody",
-  "/city/3026/GA/Buckhead",
-  "/city/35852/GA/Brookhaven",
-  "/city/33537/GA/Johns-Creek",
-  "/city/20749/GA/Woodstock",
-  "/city/26520/GA/Vinings"
+  "/marietta-ga",
+  "/kennesaw-ga",
+  "/roswell-ga",
+  "/alpharetta-ga",
+  "/milton-ga",
+  "/sandy-springs-ga",
+  "/dunwoody-ga",
+  "/buckhead-ga",
+  "/brookhaven-ga",
+  "/johns-creek-ga",
+  "/woodstock-ga",
+  "/vinings-ga"
 ];
 
-
 /** How many listing detail pages to open in parallel */
-const DETAIL_CONCURRENCY = 3;
+const DETAIL_CONCURRENCY = 1;
 /** How many LLM calls in parallel (if using LLM) */
-const TAG_CONCURRENCY = 4;
+const TAG_CONCURRENCY = 1;
 
 /* ===================== HEADERS ===================== */
 
 const HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
-  "Referer": "https://www.redfin.com/",
+  "Referer": "https://www.movoto.com/",
   "Accept-Encoding": "gzip, deflate, br, zstd",
   "Priority": "u=0, i",
   "Sec-Ch-Ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
@@ -62,40 +63,120 @@ function joinUrl(base, href) {
   return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
 }
 
-/** build Redfin search URL like /city/.../filter/remarks=... */
+/** 
+ * https://www.coldwellbankerhomes.com/ga/marietta/keyw-investor/
+ * */
 function buildRemarkUrl(cityPath, remark, page) {
-  return `${BASE_URL}${cityPath.replace(/\/$/, "")}/filter/remarks=${encodeURIComponent(remark)}${page>1 ? `/page-${page}` :''}`;
+  return `${BASE_URL}${cityPath.replace(/\/$/, "")}${page>1 ? `p-${page}` : ''}`;
 }
 
 /* ===================== PARSING ===================== */
 
 function parseCard($, card) {
   const c = $(card);
-  const item = c.find(".MapHomeCardReact.MapHomeCard > a").first();
-  const href = item.attr("href") || "";
-  const link = joinUrl(BASE_URL, href);
-  const image_url = c.find(".bp-Homecard__Photo--image").first().attr("src") ?? null;
-  const priceText = c.find(".bp-Homecard__Price--value").first().text().trim() || null;
-  const price = cleanNum(priceText);
-  const address = c.find(".bp-Homecard__Address").first().text().trim() || null;
-  const bedsText = c.find(".bp-Homecard__Stats--beds").first().text().trim() || null;
-  const bathsText = c.find(".bp-Homecard__Stats--baths").first().text().trim() || null;
-  const beds = cleanNum(bedsText);
-  const baths = cleanNum(bathsText);
-  const sqftText = c.find(".bp-Homecard__LockedStat--value").first().text().trim() || null;
-  const sqft = cleanNum(sqftText);
+  const clean = (s = '') => s.replace(/\s+/g, ' ').trim();
 
-  const remarks = c.find(".ListingRemarks, .marketingRemarks, [data-rf-test-id='listingRemarks']").first();
-  let description = null;
-  if (remarks.length) {
-    const ps = remarks.find("p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-    description = (ps.length ? ps.join(" ") : remarks.text()).replace(/\s+/g, " ").trim() || null;
-  } else {
-    description = c.attr("aria-label") || null;
-  }
+  console.log('in card ================');
+  // ---------- JSON-LD inside the card ----------
+  const safeParse = (txt) => {
+    if (!txt) return null;
+    try { return JSON.parse(txt); } catch {
+      try { return JSON.parse(txt.replace(/[\u2028\u2029]/g, '')); } catch { return null; }
+    }
+  };
+
+  const ldNodes = [];
+  c.find('script[type="application/ld+json"]').each((_, s) => {
+    const raw = $(s).contents().text();
+    const parsed = safeParse(raw);
+    if (!parsed) return;
+    if (Array.isArray(parsed)) ldNodes.push(...parsed);
+    else ldNodes.push(parsed);
+  });
+
+  const pickType = (arr, typeName) =>
+    arr.find(n => {
+      const t = n?.['@type'];
+      const types = Array.isArray(t) ? t.map(String) : t ? [String(t)] : [];
+      return types.some(tt => tt.toLowerCase() === typeName.toLowerCase());
+    });
+
+  const nodeResidence = pickType(ldNodes, 'SingleFamilyResidence') || null;
+  const nodeProduct   = pickType(ldNodes, 'Product') || null;
+
+  // ---------- LINK ----------
+  const linkHref =
+    nodeProduct?.offers?.url ||
+    nodeProduct?.url ||
+    nodeResidence?.url ||
+    c.find('.mvt-cardproperty-info a[href]').first().attr('href') ||
+    c.find('a[href]').first().attr('href') ||
+    '';
+
+  const link = joinUrl(BASE_URL, linkHref);
+
+  // ---------- IMAGE ----------
+  const firstStrOrFirst = (v) => {
+    if (!v) return null;
+    if (Array.isArray(v)) return v[0] || null;
+    if (typeof v === 'string') return v;
+    return null;
+  };
+
+  let image_url =
+    firstStrOrFirst(nodeProduct?.image) ||
+    firstStrOrFirst(nodeResidence?.image) ||
+    c.find('.mvt-cardproperty-photo img').first().attr('src') ||
+    null;
+
+  if (image_url && image_url.startsWith('//')) image_url = 'https:' + image_url;
+
+  // ---------- PRICE ----------
+  const priceFromJson = nodeProduct?.offers?.price ?? null;
+  const priceTextDom = clean(c.find('.mvt-cardproperty-info .price').first().text() || '');
+  const price = priceFromJson != null ? Number(priceFromJson) : cleanNum(priceTextDom);
+
+  // ---------- ADDRESS ----------
+  const addressDom = clean(c.find('.mvt-cardproperty-info address').first().text() || '');
+  const addressJson =
+    clean(nodeResidence?.name || nodeProduct?.name || '') || null;
+  const address = addressDom || addressJson || null;
+
+  // ---------- STATS (beds, baths, sqft) ----------
+  let beds = null, baths = null, sqft = null;
+
+  // Extract from UL: items like "3 Bd", "2 Ba", "1,851 Sq Ft"
+  c.find('.mvt-cardproperty-info ul li').each((_, li) => {
+    const t = clean($(li).text() || '');
+    if (!t) return;
+    if (beds == null && /\b(bd|bed|beds)\b/i.test(t)) {
+      beds = cleanNum(t);
+    } else if (baths == null && /\b(ba|bath|baths)\b/i.test(t)) {
+      baths = cleanNum(t);
+    } else if (sqft == null && /(sq\.?\s*ft|sqft|square\s*feet)/i.test(t)) {
+      sqft = cleanNum(t);
+    }
+  });
+
+  // ---------- DESCRIPTION ----------
+  // Movoto card typically has no remarks; JSON-LD description is often just the address
+  // so we leave description null and fetch from detail page elsewhere.
+  const description = null;
+
+  console.log({
+    image_url: image_url || null,
+    address,
+    price,
+    beds,
+    baths,
+    space: sqft ? `${sqft} sqft` : "",
+    link,
+    description,
+    sources: undefined,
+  })
 
   return {
-    image_url,
+    image_url: image_url || null,
     address,
     price,
     beds,
@@ -110,11 +191,12 @@ function parseCard($, card) {
 function parseSearchHtml(html) {
   const $ = cheerio.load(html);
   const results = [];
-  const containers = $(".HomeViews .HomeCardsContainer, .NearbyResults .HomeCardsContainer");
+  const cards = $(".search-grid .mvt-cardproperty");
 
-  containers.each((_, container) => {
-    const cards = $(container).find('[data-rf-test-name="mapHomeCard"]');
-    cards.each((__, card) => { const listing = parseCard($, card); results.push(listing); });
+  console.log(`cards length is = `+cards.length);
+  cards.each((_, card) => {
+    const listing = parseCard($, card);
+    results.push(listing);
   });
 
   return results;
@@ -122,24 +204,13 @@ function parseSearchHtml(html) {
 
 function extractRemarksFromHtml(html) {
   const $ = cheerio.load(html);
-  const candidates = [
-    ".remarksContainer .remarks",
-    "#marketingRemarks-preview .remarks",
-    ".marketingRemarks .remarks",
-    "[data-rf-test-id='listingRemarks'] .remarks",
-    "[data-rf-test-id='listingRemarks']",
-    ".remarksContainer",
-  ];
-  for (const sel of candidates) {
-    const el = $(sel).first();
-    if (el && el.length) {
-      const text = el.text().replace(/\s+/g, " ").trim();
-      if (text) return text;
-    }
-  }
-  const ps = $(".remarksContainer p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-  if (ps.length) return ps.join(" ");
-  return null;
+  const raw = $('.dpp-desc-content').first().text();
+  const text = raw
+    .replace(/\u00A0/g, ' ')   // nbsp -> space
+    .replace(/\s+/g, ' ')      // collapse whitespace
+    .trim();
+
+  return text;
 }
 
 /* ===================== BROWSER HELPERS ===================== */
@@ -156,7 +227,7 @@ async function fetchListingDescription(context, link) {
   const page = await context.newPage();
   try {
     await page.goto(link, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".remarksContainer, [data-rf-test-id='listingRemarks'], .marketingRemarks", { timeout: 15_000 }).catch(() => {});
+    await page.waitForSelector(".dpp-desc-content", { timeout: 15_000 }).catch(() => {});
     const html = await page.content();
     return extractRemarksFromHtml(html);
   } catch (e) {
@@ -283,20 +354,19 @@ async function tagListing(item) {
 
 function getPageNumber(html){
   const $ = cheerio.load(html);
-  const pages = $('.PageNumbers .ButtonLabel');
+  const nums = $('.mvt-pagination__list a')
+    .toArray()
+    .map(li => $(li).text().trim())
+    .filter(t => /^\d+$/.test(t));
 
-  if (pages.length === 0) {
-    return 0;
-  }
-
-  return parseInt(pages.last().text().trim(), 10) || 0;
+  return nums.length ? parseInt(nums[nums.length - 1], 10) : 0; // last numeric page
 }
 
 async function scrapeSearchPage(context, searchUrl) {
   const page = await context.newPage();
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
+    await page.waitForSelector(".search-grid .mvt-cardproperty", { timeout: 45_000 });
     await autoScroll(page);
 
     const html = await page.content();
@@ -314,16 +384,18 @@ async function scrapeSearchPages(context, city, term) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
+    console.log('before waiting');
+    await page.waitForSelector(".search-grid .mvt-cardproperty", { timeout: 45_000 });
+    console.log('after waiting');
     await autoScroll(page);
 
     const html = await page.content();
     const lastPage = getPageNumber(html);
+    console.log(`url=${url}, pages=${lastPage}`)
     const listings = parseSearchHtml(html);
 
-    console.log(`url=${url}, pages=${lastPage}`)
     for(let i = 2; i <= lastPage; i++){
-      const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
+      const results = await scrapeSearchPage(context, buildRemarkUrl(city, term, i)).catch(e => console.log(c));
       listings.concat(results);
     }
 
@@ -335,7 +407,7 @@ async function scrapeSearchPages(context, city, term) {
   }
 }
 
-async function scrapeAndTagAll(cityPath, terms) {
+async function scrapeAndTagAll(cityPaths) {
   let browser = null;
   let context = null;
 
@@ -350,16 +422,14 @@ async function scrapeAndTagAll(cityPath, terms) {
     context.setDefaultTimeout(30_000);
     context.setDefaultNavigationTimeout(60_000);
 
-    // 1) build search URLs for all terms
-    const searchInfo = terms.map(t => ({ term: t, city: cityPath }));
-    console.log(`Searching ${searchInfo.length} queries...`);
-
     // 2) scrape each search page
-    const pagesListings = await runWithConcurrency(searchInfo, 3, async ({ term, city }) => {
-      const results = await scrapeSearchPages(context, city, term);
+    const pagesListings = await runWithConcurrency(cityPaths, 3, async ( city ) => {
+      const results = await scrapeSearchPages(context, city, "");
       // attach source term to each
       return results.map(r => ({ ...r, sources: [term] }));
     });
+
+    console.log(pagesListings);
 
     // 3) aggregate + dedupe by link
     const byLink = new Map();
@@ -397,23 +467,14 @@ async function scrapeAndTagAll(cityPath, terms) {
 
 /* ===================== RUN (example) ===================== */
 
-async function scrapeRedfin() {
-  // Build combined terms: damage + sale-types
-  const TERMS = ["damage", ...SALE_TYPE_KEYWORDS];
-  const results = [];
+async function scrapeMovoto() {
+  const data = await scrapeAndTagAll(CITY_PATHS);
+  const uniqueByAddress = Array.from(
+    new Map(data.map(item => [item.address, item])).values()
+  );
 
-  for (const CITY_PATH of CITY_PATHS) {
-    const data = await scrapeAndTagAll(CITY_PATH, TERMS);
-    
-    const uniqueByAddress = Array.from(
-      new Map(data.map(item => [item.address, item])).values()
-    );
-    results.push(...uniqueByAddress);
-    Estate.insertMany(uniqueByAddress).catch(e => console.log(e));
-  }
-
-  // Print to console
-  console.log(`\nKept ${results.length} listings with ≥1 matching keyword.`);
+  results.push(...uniqueByAddress);
+  Estate.insertMany(uniqueByAddress).catch(e => console.log(e));
 }
 
-module.exports = { scrapeRedfin };
+module.exports = { scrapeMovoto };

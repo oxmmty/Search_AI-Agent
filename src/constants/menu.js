@@ -75,7 +75,7 @@ const USER_MENU_ITEMS = [
         code: 'logout',
         label: {
           zh_CN: '引导',
-          en_US: 'Log Out',
+          en_US: 'LogOut',
         },
         icon: 'logout',
         path: '/log-out',

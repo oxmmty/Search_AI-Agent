@@ -6,27 +6,22 @@ const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords')
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
-const BASE_URL = "https://www.redfin.com";
+const BASE_URL = "https://www.trulia.com";
 const CITY_PATHS = [
-  "/city/12766/GA/Marietta",
-  "/city/10991/GA/Kennesaw",
-  "/city/17232/GA/Roswell",
-  "/city/438/GA/Alpharetta",
-  "/city/33985/GA/Milton",
-  "/city/17553/GA/Sandy-Springs",
-  "/city/22699/GA/Dunwoody",
-  "/city/3026/GA/Buckhead",
-  "/city/35852/GA/Brookhaven",
-  "/city/33537/GA/Johns-Creek",
-  "/city/20749/GA/Woodstock",
-  "/city/26520/GA/Vinings"
+  "/for_sale/Marietta,GA",
+  "/GA/Kennesaw",
+  "/for_sale/Roswell,GA",
+  "/for_sale/Alpharetta,GA",
+  "/for_sale/Milton,GA",
+  "/for_sale/Sandy_Springs,GA",
+  "/for_sale/Dunwoody,GA",
+  "/GA/Atlanta,Buckhead_Village",
+  "/for_sale/Brookhaven,GA",
+  "/for_sale/Johns_Creek,GA",
+  "/for_sale/Woodstock,GA",
+  "/for_sale/Vinings,GA"
 ];
 
-
-/** How many listing detail pages to open in parallel */
-const DETAIL_CONCURRENCY = 3;
-/** How many LLM calls in parallel (if using LLM) */
-const TAG_CONCURRENCY = 4;
 
 /* ===================== HEADERS ===================== */
 
@@ -62,37 +57,75 @@ function joinUrl(base, href) {
   return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
 }
 
-/** build Redfin search URL like /city/.../filter/remarks=... */
+/** build Trulia search URL like /for_sale/City,ST/<keyword>_keyword */
 function buildRemarkUrl(cityPath, remark, page) {
-  return `${BASE_URL}${cityPath.replace(/\/$/, "")}/filter/remarks=${encodeURIComponent(remark)}${page>1 ? `/page-${page}` :''}`;
+  return `${BASE_URL}${cityPath.replace(/\/$/, "")}/${encodeURIComponent(remark)}_keyword${page>1 ? `/${page}_p` :''}`;
 }
 
 /* ===================== PARSING ===================== */
 
 function parseCard($, card) {
   const c = $(card);
-  const item = c.find(".MapHomeCardReact.MapHomeCard > a").first();
-  const href = item.attr("href") || "";
+  // Link
+  const href =
+    c.find('a[data-testid="property-card-link"]').attr('href') ||
+    c.find('[data-testid="property-card-carousel-container"] a[href]').attr('href') ||
+    c.find('.PropertyCard a[href]').attr('href') ||
+    c.find("a[href^='/home/']").attr('href') ||
+    "";
   const link = joinUrl(BASE_URL, href);
-  const image_url = c.find(".bp-Homecard__Photo--image").first().attr("src") ?? null;
-  const priceText = c.find(".bp-Homecard__Price--value").first().text().trim() || null;
+
+  // Image
+  const image_url =
+    c.find('[data-testid^="property-image-"] img').first().attr('src') ||
+    c.find('.property-card-media img').first().attr('src') ||
+    c.find('img.image').first().attr('src') ||
+    null;
+
+  // Price
+  let priceText =
+    c.find('[data-testid="property-price"]').first().attr('title') ||
+    c.find('[data-testid="property-price"]').first().text() ||
+    null;
+  priceText = priceText ? priceText.trim() : null;
   const price = cleanNum(priceText);
-  const address = c.find(".bp-Homecard__Address").first().text().trim() || null;
-  const bedsText = c.find(".bp-Homecard__Stats--beds").first().text().trim() || null;
-  const bathsText = c.find(".bp-Homecard__Stats--baths").first().text().trim() || null;
+
+  // Address
+  let address = c.find('[data-testid="property-address"]').first().text() || null;
+  if (address) {
+    address = address.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  }
+
+  // Beds / Baths
+  const bedsText =
+    c.find('[data-testid="property-beds"] strong').first().text().trim() ||
+    c.find('[data-testid="property-beds"]').first().text().trim() ||
+    null;
+  const bathsText =
+    c.find('[data-testid="property-baths"] strong').first().text().trim() ||
+    c.find('[data-testid="property-baths"]').first().text().trim() ||
+    null;
   const beds = cleanNum(bedsText);
   const baths = cleanNum(bathsText);
-  const sqftText = c.find(".bp-Homecard__LockedStat--value").first().text().trim() || null;
+
+  // Sqft
+  let sqftText =
+    c.find('[data-testid="property-floorSpace"]').first().text().trim() ||
+    c.find('[data-testid="property-sqft"]').first().text().trim() ||
+    null;
+  if (!sqftText) {
+    const detailsText = c.find('[data-testid="property-card-details"]').text();
+    const m = detailsText && detailsText.match(/([\d,.]+)\s*(?:sq\s?ft|sqft)/i);
+    if (m) sqftText = m[1];
+  }
   const sqft = cleanNum(sqftText);
 
-  const remarks = c.find(".ListingRemarks, .marketingRemarks, [data-rf-test-id='listingRemarks']").first();
-  let description = null;
-  if (remarks.length) {
-    const ps = remarks.find("p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-    description = (ps.length ? ps.join(" ") : remarks.text()).replace(/\s+/g, " ").trim() || null;
-  } else {
-    description = c.attr("aria-label") || null;
-  }
+  // Description (summary line on card)
+  let description =
+    c.find('[data-testid="property-card-listing-summary"]').first().text().trim() ||
+    c.attr('aria-label') ||
+    null;
+  if (description) description = description.replace(/\s+/g, ' ').trim();
 
   return {
     image_url,
@@ -110,11 +143,18 @@ function parseCard($, card) {
 function parseSearchHtml(html) {
   const $ = cheerio.load(html);
   const results = [];
-  const containers = $(".HomeViews .HomeCardsContainer, .NearbyResults .HomeCardsContainer");
 
-  containers.each((_, container) => {
-    const cards = $(container).find('[data-rf-test-name="mapHomeCard"]');
-    cards.each((__, card) => { const listing = parseCard($, card); results.push(listing); });
+  $('ul[data-testid="search-result-list-container"] > li').each((_, li) => {
+    const el = $(li);
+
+    const isCard =
+      el.is('[data-testid^="srp-home-card"]') ||
+      el.find('[data-testid="home-card-sale"], .PropertyCard, [data-testid="property-card-link"]').length > 0;
+
+    if (!isCard) return;
+
+    const listing = parseCard($, li);
+    if (listing) results.push(listing);
   });
 
   return results;
@@ -122,41 +162,42 @@ function parseSearchHtml(html) {
 
 function extractRemarksFromHtml(html) {
   const $ = cheerio.load(html);
-  const candidates = [
-    ".remarksContainer .remarks",
-    "#marketingRemarks-preview .remarks",
-    ".marketingRemarks .remarks",
-    "[data-rf-test-id='listingRemarks'] .remarks",
-    "[data-rf-test-id='listingRemarks']",
-    ".remarksContainer",
+  const selectors = [
+    '[data-testid="home-description-text-description-text"]',
+    '[data-testid="home-description-text"]',
+    '[data-testid="home-description-content"]',
+    '[data-testid="home-description"]'
   ];
-  for (const sel of candidates) {
+
+  for (const sel of selectors) {
     const el = $(sel).first();
-    if (el && el.length) {
-      const text = el.text().replace(/\s+/g, " ").trim();
+    if (el.length) {
+      const clone = el.clone();
+      clone.find('br').replaceWith(' ');
+      clone.find('p').each((_, p) => {
+        const $p = $(p);
+        $p.after(' ');
+      });
+
+      const text = clone.text().replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').trim();
       if (text) return text;
     }
   }
-  const ps = $(".remarksContainer p").toArray().map(p => $(p).text().trim()).filter(Boolean);
-  if (ps.length) return ps.join(" ");
+
   return null;
 }
 
 /* ===================== BROWSER HELPERS ===================== */
 
-async function autoScroll(page, { step = 1000, pauseMs = 600, maxSteps = 15 } = {}) {
-  for (let i = 0; i < maxSteps; i++) {
-    await page.evaluate(s => window.scrollBy(0, s), step);
-    await page.waitForTimeout(pauseMs);
-  }
-}
+// NOTE: Removed all waitForSelector calls and any scrolling.
+// We just load the HTML and parse whatever is there.
 
+/** Fetch description HTML without waiting for selectors */
 async function fetchListingDescription(context, link) {
   if (!link) return null;
   const page = await context.newPage();
   try {
     await page.goto(link, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".remarksContainer, [data-rf-test-id='listingRemarks'], .marketingRemarks", { timeout: 15_000 }).catch(() => {});
     const html = await page.content();
     return extractRemarksFromHtml(html);
   } catch (e) {
@@ -165,20 +206,6 @@ async function fetchListingDescription(context, link) {
   } finally {
     await page.close().catch(() => {});
   }
-}
-
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let i = 0;
-  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) break;
-      results[idx] = await worker(items[idx], idx);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 /* ===================== TAGGING ===================== */
@@ -203,12 +230,10 @@ let getLLM;
   };
 }
 
-/** fast fallback tagging (no LLM required) */
 function heuristicTags(description) {
   const t = (description || "").toLowerCase();
   const damage = DAMAGE_CANON.filter(k => t.includes(k));
   const sale = SALE_CANON.filter(k => t.includes(k));
-  // handle "tlc" variants (normalize)
   if (/\bneeds\s+tlc\b/i.test(description) && !damage.includes("tlc")) damage.push("tlc");
   if (/\bneeds\s+tlc\b/i.test(description) && !sale.includes("needs tlc")) sale.push("needs tlc");
   return {
@@ -217,7 +242,6 @@ function heuristicTags(description) {
   };
 }
 
-/** LLM structured tagging (optional) */
 const ResultSchema = z.object({
   damage: z.array(z.enum(DAMAGE_CANON)),
   sale_types: z.array(z.enum(SALE_CANON)),
@@ -257,14 +281,12 @@ async function tagListing(item) {
   if (!text.trim()) return { ...item, damage_tags: [], saletype_tags: [], recommendation: "No description." };
 
   if (!process.env.OPENAI_API_KEY) {
-    // heuristic only
     const h = heuristicTags(text);
     return { ...item, ...h, recommendation: "Heuristic tags (no LLM key provided)." };
   }
 
   try {
     const res = await llmTags(text);
-    // merge in any obvious heuristics that LLM might miss (optional)
     const h = heuristicTags(text);
     return {
       ...item,
@@ -296,11 +318,10 @@ async function scrapeSearchPage(context, searchUrl) {
   const page = await context.newPage();
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
-    await autoScroll(page);
-
     const html = await page.content();
     const listings = parseSearchHtml(html);
+    // If no items found, return empty array (per requirement)
+    if (!Array.isArray(listings) || listings.length === 0) return [];
     return listings;
   } catch (e) {
     return [];
@@ -314,7 +335,7 @@ async function scrapeSearchPages(context, city, term) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
+    // await page.waitForSelector(".HomeViews .HomeCardsContainer, .HomeCardsContainer", { timeout: 45_000 });
     await autoScroll(page);
 
     const html = await page.content();
@@ -340,6 +361,7 @@ async function scrapeAndTagAll(cityPath, terms) {
   let context = null;
 
   try {
+    // NO headless: keep visible browser
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext({
       userAgent: HEADERS["User-Agent"],
@@ -350,18 +372,19 @@ async function scrapeAndTagAll(cityPath, terms) {
     context.setDefaultTimeout(30_000);
     context.setDefaultNavigationTimeout(60_000);
 
-    // 1) build search URLs for all terms
+    // 1) Build search URLs for all terms
     const searchInfo = terms.map(t => ({ term: t, city: cityPath }));
     console.log(`Searching ${searchInfo.length} queries...`);
 
-    // 2) scrape each search page
-    const pagesListings = await runWithConcurrency(searchInfo, 3, async ({ term, city }) => {
+    // 2) Scrape each search page SEQUENTIALLY (no multithreading)
+    const pagesListings = [];
+    for (const { term, city } of searchInfo) {
       const results = await scrapeSearchPages(context, city, term);
-      // attach source term to each
-      return results.map(r => ({ ...r, sources: [term] }));
-    });
+      const taggedSources = results.map(r => ({ ...r, sources: [term] }));
+      pagesListings.push(taggedSources);
+    }
 
-    // 3) aggregate + dedupe by link
+    // 3) Aggregate + dedupe by link
     const byLink = new Map();
     for (const arr of pagesListings) {
       for (const l of arr) {
@@ -376,16 +399,21 @@ async function scrapeAndTagAll(cityPath, terms) {
     let listings = Array.from(byLink.values());
     console.log(`Found ${listings.length} unique listings across queries.`);
 
-    // 4) enrich: fetch full description for each listing
-    listings = await runWithConcurrency(listings, DETAIL_CONCURRENCY, async (lst) => {
+    // 4) Enrich: fetch full description for each listing SEQUENTIALLY
+    const enriched = [];
+    for (const lst of listings) {
       const desc = await fetchListingDescription(context, lst.link);
-      return { ...lst, description: desc ?? lst.description ?? null };
-    });
+      enriched.push({ ...lst, description: desc ?? lst.description ?? null });
+    }
 
-    // 5) tag each listing
-    const tagged = await runWithConcurrency(listings, TAG_CONCURRENCY, tagListing);
+    // 5) Tag each listing SEQUENTIALLY
+    const tagged = [];
+    for (const item of enriched) {
+      const t = await tagListing(item);
+      tagged.push(t);
+    }
 
-    // 6) filter: keep only items with at least one tag
+    // 6) Filter: keep only items with at least one tag
     const filtered = tagged.filter(l => (l.damage_tags.length + l.saletype_tags.length) > 0);
 
     return filtered;
@@ -397,7 +425,7 @@ async function scrapeAndTagAll(cityPath, terms) {
 
 /* ===================== RUN (example) ===================== */
 
-async function scrapeRedfin() {
+async function scrapeTrulia() {
   // Build combined terms: damage + sale-types
   const TERMS = ["damage", ...SALE_TYPE_KEYWORDS];
   const results = [];
@@ -412,8 +440,7 @@ async function scrapeRedfin() {
     Estate.insertMany(uniqueByAddress).catch(e => console.log(e));
   }
 
-  // Print to console
   console.log(`\nKept ${results.length} listings with ≥1 matching keyword.`);
 }
 
-module.exports = { scrapeRedfin };
+module.exports = { scrapeTrulia };
