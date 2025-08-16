@@ -419,6 +419,8 @@ async function scrapeSearchPage(context, searchUrl) {
 
     const html = await page.content();
     const listings = parseSearchHtml(html);
+
+    console.log(`url = ${searchUrl}, listings length is = `+listings?.length);
     return listings;
   } catch (e) {
     return [];

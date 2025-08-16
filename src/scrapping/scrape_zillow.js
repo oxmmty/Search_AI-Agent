@@ -4,7 +4,7 @@ const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { z } = require('zod');
 
-const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords');
+const { DAMAGE_KEYWORDS, DAMAGE_KEYWORDS_SEARCH, SALE_TYPE_KEYWORDS } = require('../constants/keywords');
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
@@ -63,9 +63,7 @@ function joinUrl(base, href) {
   return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
 }
 
-/** 
- * 
- * */
+/**/
 function buildRemarkUrl(cityPath, remark, page) {
   return `${BASE_URL}${cityPath.replace(/\/$/, "").replace("**KEYWORD**", remark).replace("**PAGE**", page > 1 ? `%2C%22pagination%22%3A%7B%22currentPage%22%3A${page}%7D` : "").replace("**PAGENUM**", page > 1 ? `${page}_p/` : "")}`;
 }
@@ -344,6 +342,9 @@ async function scrapeSearchPage(context, searchUrl) {
 
     const html = await page.content();
     const listings = parseSearchHtml(html);
+
+    console.log(`url = ${searchUrl}, listings length is = `+listings?.length);
+
     return listings;
   } catch (e) {
     return [];
@@ -363,9 +364,12 @@ async function scrapeSearchPages(context, city, term) {
     await autoScroll(page);
 
     const html = await page.content();
+    console.log('page conten = ' + html)
     const lastPage = getPageNumber(html);
     console.log(`url=${url}, pages=${lastPage}`)
     const listings = parseSearchHtml(html);
+
+    console.log(`url = ${url}, listings length is = `+listings?.length);
 
     for(let i = 2; i <= lastPage; i++){
       const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
@@ -447,7 +451,7 @@ async function scrapeAndTagAll(cityPath, terms) {
 
 async function scrapeZillow() {
   // Build combined terms: damage + sale-types
-  const TERMS = ["damage", ...SALE_TYPE_KEYWORDS];
+  const TERMS = [...DAMAGE_KEYWORDS_SEARCH, ...SALE_TYPE_KEYWORDS];
   const results = [];
 
   for (const CITY_PATH of CITY_PATHS) {

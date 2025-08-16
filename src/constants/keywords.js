@@ -1,4 +1,5 @@
 const DAMAGE_KEYWORDS = [
+  "TLC",
   "repair",
   "fixer-upper",
   "damage",
@@ -11,8 +12,24 @@ const DAMAGE_KEYWORDS = [
   "tree damage",
   "fire damage",
   "mold",
-  "asbestos",
-  "TLC"
+  "asbestos"
+];
+
+const DAMAGE_KEYWORDS_SEARCH = [
+  "TLC",
+  "repair",
+  "fixer-upper",
+  "damage",
+  "insurance claim",
+  "mitigation",
+  "renovate",
+  "restoration",
+  "storm",
+  "water",
+  "tree",
+  "fire",
+  "mold",
+  "asbestos"
 ];
 
 const SALE_TYPE_KEYWORDS = [
@@ -30,4 +47,4 @@ const SALE_TYPE_KEYWORDS = [
   "flip"
 ];
 
-module.exports = { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS }
+module.exports = { DAMAGE_KEYWORDS, DAMAGE_KEYWORDS_SEARCH, SALE_TYPE_KEYWORDS }

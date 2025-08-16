@@ -12,7 +12,7 @@ const Estate = require("../src/models/estate");
 
   console.log("Running scrapping real estates websites");
 
-  Promise.allSettled([
+  Promise.all([
     scrapeZillow().then(() => console.log('scraping zillow has finished')),
     scrapeMovoto().then(() => console.log('scraping movoto has finished')),
     scrapeColdwellbankerhomes().then(() => console.log('scraping Coldwellbankerhomes has finished')),
@@ -25,7 +25,7 @@ const Estate = require("../src/models/estate");
 
     const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
     Estate.deleteMany({ createdAt: { $lt: twelveHoursAgo } }).catch(e => console.log(e));
-  });
+  }).catch(e => console.log(e));
 // }, {
 //   timezone: "America/New_York",
 // });

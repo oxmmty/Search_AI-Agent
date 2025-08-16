@@ -320,6 +320,8 @@ async function scrapeSearchPage(context, searchUrl) {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     const html = await page.content();
     const listings = parseSearchHtml(html);
+
+    console.log(`url = ${searchUrl}, listings length is = `+listings?.length);
     // If no items found, return empty array (per requirement)
     if (!Array.isArray(listings) || listings.length === 0) return [];
     return listings;
