@@ -13,8 +13,11 @@ function downTwoDecimal(number) {
     return Math.floor(number * 100) / 100;
 }
 
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
 module.exports = {
     calculateFeeAmount,
     ceilTwoDecimal,
-    downTwoDecimal
+    downTwoDecimal,
+    sleep
 }

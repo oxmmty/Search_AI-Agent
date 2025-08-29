@@ -1,11 +1,9 @@
-require('dotenv').config();
-
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
-const { z } = require('zod');
 
-const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords');
+const { tagListing, autoScroll, cleanNum, joinUrl } = require('./common');
 const Estate = require('../models/estate');
+
 /* ======================= CONFIG ======================= */
 
 const BASE_URL = "https://www.remax.com";
@@ -24,12 +22,7 @@ const CITY_PATHS = [
   "/homes-for-sale/ga/vinings/city/1379612"
 ];
 
-/** How many listing detail pages to open in parallel */
 const DETAIL_CONCURRENCY = 3;
-/** How many LLM calls in parallel (if using LLM) */
-const TAG_CONCURRENCY = 4;
-
-/* ===================== HEADERS ===================== */
 
 const HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
@@ -47,28 +40,7 @@ const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 };
 
-/* =================== HELPERS =================== */
 
-function cleanNum(text) {
-  if (!text) return null;
-  const m = /[\d.]+/.exec(text.replace(/,/g, ""));
-  if (!m) return null;
-  const val = Number(m[0]);
-  return Number.isFinite(val) ? Math.trunc(val) : null;
-}
-
-function joinUrl(base, href) {
-  if (!href) return "";
-  if (/^https?:\/\//i.test(href)) return href;
-  return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
-}
-
-/** 
- * https://www.homes.com/marietta-ga/p2/?kws=is-as
- * */
-function buildRemarkUrl(cityPath, remark, page) {
-  return `${BASE_URL}${cityPath.replace(/\/$/, "")}?searchQuery={"filters":{"keywords":"${encodeURIComponent(remark)}"},"pageNumber":${page}}`;
-}
 
 /* ===================== PARSING ===================== */
 
@@ -136,17 +108,6 @@ function parseCard($, card) {
 
   // No description on listing card in this layout; fetch on detail page instead
   const description = null;
-  // console.log({
-  //   image_url: image_url || null,
-  //   address,
-  //   price,
-  //   beds,
-  //   baths,
-  //   space: sqft ? `${sqft} sqft` : "",
-  //   link,
-  //   description,
-  //   sources: undefined,
-  // });
 
   return {
     image_url: image_url || null,
@@ -160,7 +121,6 @@ function parseCard($, card) {
     sources: undefined,
   };
 }
-
 
 function parseSearchHtml(html) {
   const $ = cheerio.load(html);
@@ -202,12 +162,6 @@ function extractRemarksFromHtml(html) {
 
 /* ===================== BROWSER HELPERS ===================== */
 
-async function autoScroll(page, { step = 1000, pauseMs = 600, maxSteps = 15 } = {}) {
-  for (let i = 0; i < maxSteps; i++) {
-    await page.evaluate(s => window.scrollBy(0, s), step);
-    await page.waitForTimeout(pauseMs);
-  }
-}
 
 async function fetchListingDescription(context, link) {
   if (!link) return null;
@@ -225,119 +179,29 @@ async function fetchListingDescription(context, link) {
   }
 }
 
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let i = 0;
-  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) break;
-      results[idx] = await worker(items[idx], idx);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-}
-
-/* ===================== TAGGING ===================== */
-
-const DAMAGE_CANON = DAMAGE_KEYWORDS.map(k => k.toLowerCase());
-const SALE_CANON = SALE_TYPE_KEYWORDS.map(k => k.toLowerCase());
-
-// Lazy-load ESM-only @langchain/openai and cache single instance
-let getLLM;
-{
-  let llmSingleton = null;
-  getLLM = async () => {
-    if (!llmSingleton) {
-      const { ChatOpenAI } = await import('@langchain/openai');
-      llmSingleton = new ChatOpenAI({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        apiKey: process.env.OPENAI_API_KEY || "",
-        temperature: 0
-      });
-    }
-    return llmSingleton;
-  };
-}
-
-/** fast fallback tagging (no LLM required) */
-function heuristicTags(description) {
-  const t = (description || "").toLowerCase();
-  const damage = DAMAGE_CANON.filter(k => t.includes(k));
-  const sale = SALE_CANON.filter(k => t.includes(k));
-  // handle "tlc" variants (normalize)
-  if (/\bneeds\s+tlc\b/i.test(description) && !damage.includes("tlc")) damage.push("tlc");
-  if (/\bneeds\s+tlc\b/i.test(description) && !sale.includes("needs tlc")) sale.push("needs tlc");
-  return {
-    damage_tags: Array.from(new Set(damage)),
-    saletype_tags: Array.from(new Set(sale)),
-  };
-}
-
-/** LLM structured tagging (optional) */
-const ResultSchema = z.object({
-  damage: z.array(z.enum(DAMAGE_CANON)),
-  sale_types: z.array(z.enum(SALE_CANON)),
-  rationale: z.string(),
-});
-
-async function llmTags(description) {
-  const prompt = [
-    { role: "system", content: "Tag real-estate descriptions with exact allowed lowercase keywords only. Prefer high precision." },
-    {
-      role: "user",
-      content: [
-        "ALLOWED DAMAGE:",
-        ...DAMAGE_CANON.map(k => `- ${k}`),
-        "",
-        "ALLOWED SALE TYPES:",
-        ...SALE_CANON.map(k => `- ${k}`),
-        "",
-        "OUTPUT JSON with fields: damage[], sale_types[], rationale",
-        "DESCRIPTION:",
-        description,
-      ].join("\n"),
-    },
-  ];
-  const llm = await getLLM();
-  const out = await llm.withStructuredOutput(ResultSchema).invoke(prompt);
-  const uniq = a => Array.from(new Set(a));
-  return {
-    damage_tags: uniq(out.damage),
-    saletype_tags: uniq(out.sale_types),
-    recommendation: out.rationale,
-  };
-}
-
-async function tagListing(item) {
-  const text = item.description || "";
-  if (!text.trim()) return { ...item, damage_tags: [], saletype_tags: [], recommendation: "No description." };
-
-  if (!process.env.OPENAI_API_KEY) {
-    // heuristic only
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "Heuristic tags (no LLM key provided)." };
-  }
-
-  try {
-    const res = await llmTags(text);
-    // merge in any obvious heuristics that LLM might miss (optional)
-    const h = heuristicTags(text);
-    return {
-      ...item,
-      damage_tags: Array.from(new Set([...res.damage_tags, ...h.damage_tags])),
-      saletype_tags: Array.from(new Set([...res.saletype_tags, ...h.saletype_tags])),
-      recommendation: res.recommendation || "LLM tags",
-    };
-  } catch (e) {
-    console.warn("LLM tagging failed; falling back to heuristic:", (e?.message));
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "" };
-  }
-}
-
 /* ===================== SCRAPE + AGGREGATE ===================== */
+
+async function saveListingsToDB(listings, cityPath) {
+  const savedListings = [];
+  
+  for (const listing of listings) {
+    try {
+      // Add city info to listing
+      listing.city = cityPath;
+      listing.sources = [cityPath];
+      
+      // Save to DB and get the saved document with _id
+      const savedListing = await Estate.create(listing);
+      savedListings.push(savedListing);
+      console.log(`Saved listing: ${listing.address} with ID: ${savedListing._id}`);
+    } catch (e) {
+      console.error(`Error saving listing ${listing.address}:`, e.message);
+    }
+  }
+  
+  console.log(`Successfully saved ${savedListings.length} listings to database for this page`);
+  return savedListings;
+}
 
 function getPageNumber(html){
   const $ = cheerio.load(html);
@@ -350,10 +214,13 @@ function getPageNumber(html){
 }
 
 async function scrapeSearchPage(context, searchUrl) {
+  console.log(`in sub page ${searchUrl}`);
   const page = await context.newPage();
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    console.log(`before waiting url=${searchUrl}`);
     await page.waitForSelector("ul.d-search-results-listing-cards li.d-search-results-listing-card-item", { timeout: 45_000 });
+    console.log(`after waiting url=${searchUrl}`);
     await autoScroll(page);
 
     const html = await page.content();
@@ -362,97 +229,169 @@ async function scrapeSearchPage(context, searchUrl) {
     console.log(`url = ${searchUrl}, listings length is = `+listings?.length);
     return listings;
   } catch (e) {
+    console.error(`Error scraping page ${searchUrl}:`, e.message);
     return [];
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-async function scrapeSearchPages(context, city, term) {
-  const url = buildRemarkUrl(city, term, 1)
+async function scrapeAllPagesForCity(context, cityPath) {
+  console.log(`Starting to scrape city: ${cityPath}`);
+  
+  // Build URL for first page (no terms, just city)
+  const baseUrl = `${BASE_URL}${cityPath}`;
   const page = await context.newPage();
+  
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    // console.log('before waiting');
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    console.log(`Navigated to base URL: ${baseUrl}`);
+    
     await page.waitForSelector("ul.d-search-results-listing-cards li.d-search-results-listing-card-item", { timeout: 45_000 });
-    // console.log('after waiting');
+    console.log(`Found listing cards on base page`);
+    
     await autoScroll(page);
-
+    
     const html = await page.content();
     const lastPage = getPageNumber(html);
-    // console.log(`url=${url}, pages=${lastPage}`)
-    const listings = parseSearchHtml(html);
-
-    for(let i = 2; i <= lastPage; i++){
-      const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
-      listings.concat(results);
+    console.log(`City: ${cityPath}, Total pages: ${lastPage}`);
+    
+    const allSavedListings = [];
+    
+    // Process first page
+    let firstPageListings = parseSearchHtml(html);
+    console.log(`Page 1: ${firstPageListings.length} listings`);
+    
+    // Save first page listings to DB immediately
+    const savedFirstPage = await saveListingsToDB(firstPageListings, cityPath);
+    allSavedListings.push(...savedFirstPage);
+    
+    // Scrape and save remaining pages one by one
+    for (let i = 2; i <= lastPage; i++) {
+      const pageUrl = `${baseUrl}?pageNumber=${i}`;
+      const results = await scrapeSearchPage(context, pageUrl);
+      console.log(`Page ${i}: ${results.length} listings`);
+      
+      // Save this page's listings to DB immediately
+      const savedPageListings = await saveListingsToDB(results, cityPath);
+      allSavedListings.push(...savedPageListings);
     }
-
-    return listings;
+    
+    console.log(`City ${cityPath}: Total listings saved to DB: ${allSavedListings.length}`);
+    return allSavedListings;
+    
   } catch (e) {
+    console.error(`Error scraping city ${cityPath}:`, e.message);
     return [];
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-async function scrapeAndTagAll(cityPath, terms) {
+async function scrapeAndProcessCity(context, cityPath) {
+  console.log(`\n=== Processing City: ${cityPath} ===`);
+  
+  // 1. Scrape all pages for this city and save to DB per page
+  let savedListings = [];
+  if(!cityPath.includes('marietta')){
+    savedListings = await scrapeAllPagesForCity(context, cityPath);
+    if (savedListings.length === 0) {
+      console.log(`No listings found for city: ${cityPath}`);
+      return [];
+    }
+  }else{
+    savedListings = await Estate.find().sort({ createdAt: -1 }).lean();
+  }
+
+  console.log(`All pages scraped and saved to database. Total listings: ${savedListings.length}`);
+  
+  // 2. Fetch descriptions for each listing and update DB
+  console.log(`Fetching descriptions for ${savedListings.length} listings...`);
+  for (let i = 0; i < savedListings.length; i++) {
+    if(cityPath.includes('marietta') && i < 329){
+      continue;
+    }
+    const listing = savedListings[i];
+    try {
+      const description = await fetchListingDescription(context, listing.link);
+      if (description) {
+        // Update the listing object
+        listing.description = description;
+        
+        // Update in database
+        await Estate.findByIdAndUpdate(listing._id, { description });
+        console.log(`Updated description for listing ${i + 1}/${savedListings.length}: ${listing.address}`);
+      }
+    } catch (e) {
+      console.error(`Error fetching description for ${listing.address}:`, e.message);
+    }
+  }
+  
+  // 3. Apply tagging and update DB records
+  console.log(`Applying tags to ${savedListings.length} listings...`);
+  for (let i = 0; i < savedListings.length; i++) {
+    const listing = savedListings[i];
+    try {
+      // Get tags using tagListing function
+      const tagged = await tagListing(listing);
+      
+      // Update listing object
+      listing.damage_tags = tagged.damage_tags || [];
+      listing.saletype_tags = tagged.saletype_tags || [];
+      listing.recommendation = tagged.recommendation || '';
+      
+      // Update in database
+      await Estate.findByIdAndUpdate(listing._id, {
+        damage_tags: listing.damage_tags,
+        saletype_tags: listing.saletype_tags,
+        recommendation: listing.recommendation
+      });
+      
+      console.log(`Applied tags for listing ${i + 1}/${savedListings.length}: ${listing.address}`);
+      console.log(`  Damage tags: ${listing.damage_tags.join(', ')}`);
+      console.log(`  Sale type tags: ${listing.saletype_tags.join(', ')}`);
+      
+    } catch (e) {
+      console.error(`Error applying tags for ${listing.address}:`, e.message);
+    }
+  }
+  
+  console.log(`=== Completed processing city: ${cityPath} ===\n`);
+  return savedListings;
+}
+
+async function scrapeAndTagAll() {
   let browser = null;
   let context = null;
 
   try {
     browser = await chromium.launch({ headless: true });
+    
     context = await browser.newContext({
       userAgent: HEADERS["User-Agent"],
       locale: "en-US",
       extraHTTPHeaders: HEADERS,
-      viewport: { width: 1366, height: 900 },
+      viewport: { width: 1366, height: 900 }
     });
     context.setDefaultTimeout(30_000);
     context.setDefaultNavigationTimeout(60_000);
 
-    // 1) build search URLs for all terms
-    const searchInfo = terms.map(t => ({ term: t, city: cityPath }));
-    console.log(`Searching ${searchInfo.length} queries...`);
-    console.log(searchInfo);
-
-    // 2) scrape each search page
-    const pagesListings = await runWithConcurrency(searchInfo, 3, async ({ term, city }) => {
-      const results = await scrapeSearchPages(context, city, term);
-      // attach source term to each
-      return results.map(r => ({ ...r, sources: [term] }));
-    });
-
-    console.log(pagesListings);
-
-    // 3) aggregate + dedupe by link
-    const byLink = new Map();
-    for (const arr of pagesListings) {
-      for (const l of arr) {
-        const existing = byLink.get(l.link);
-        if (existing) {
-          existing.sources = Array.from(new Set([...(existing.sources || []), ...(l.sources || [])]));
-        } else {
-          byLink.set(l.link, l);
-        }
+    const allResults = [];
+    
+    // Loop through each city path
+    for (const cityPath of CITY_PATHS) {
+      try {
+        const cityResults = await scrapeAndProcessCity(context, cityPath);
+        allResults.push(...cityResults);
+      } catch (error) {
+        console.error(`❌ Error processing city ${cityPath}:`, error.message);
+        // Continue with next city
       }
     }
-    let listings = Array.from(byLink.values());
-    console.log(`Found ${listings.length} unique listings across queries.`);
-
-    // 4) enrich: fetch full description for each listing
-    listings = await runWithConcurrency(listings, DETAIL_CONCURRENCY, async (lst) => {
-      const desc = await fetchListingDescription(context, lst.link);
-      return { ...lst, description: desc ?? lst.description ?? null };
-    });
-
-    // 5) tag each listing
-    const tagged = await runWithConcurrency(listings, TAG_CONCURRENCY, tagListing);
-
-    // 6) filter: keep only items with at least one tag
-    const filtered = tagged.filter(l => (l.damage_tags.length + l.saletype_tags.length) > 0);
-
-    return filtered;
+    
+    console.log(`\nTotal processing completed. Processed ${allResults.length} listings across all cities.`);
+    return allResults;
+    
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
@@ -462,22 +401,19 @@ async function scrapeAndTagAll(cityPath, terms) {
 /* ===================== RUN (example) ===================== */
 
 async function scrapeRemax() {
-  // Build combined terms: damage + sale-types
-  const TERMS = ["damage", ...SALE_TYPE_KEYWORDS];
-  const results = [];
-
-  for (const CITY_PATH of CITY_PATHS) {
-    const data = await scrapeAndTagAll(CITY_PATH, TERMS);
-    
-    const uniqueByAddress = Array.from(
-      new Map(data.map(item => [item.address, item])).values()
-    );
-    results.push(...uniqueByAddress);
-    Estate.insertMany(uniqueByAddress).catch(e => console.log(e));
-  }
-
-  // Print to console
-  console.log(`\nKept ${results.length} listings with ≥1 matching keyword.`);
+  console.log('Starting RE/MAX scraper with new flow...');
+  const results = await scrapeAndTagAll();
+  
+  // Filter results to show only those with tags
+  const taggedResults = results.filter(l => 
+    (l.damage_tags && l.damage_tags.length > 0) || 
+    (l.saletype_tags && l.saletype_tags.length > 0)
+  );
+  
+  console.log(`\nScraping completed!`);
+  console.log(`Total listings processed: ${results.length}`);
+  console.log(`Listings with tags: ${taggedResults.length}`);
+  console.log(`Listings without tags: ${results.length - taggedResults.length}`);
 }
 
 module.exports = { scrapeRemax };

@@ -14,12 +14,12 @@ const Estate = require("../src/models/estate");
 
   Promise.all([
     scrapeZillow().then(() => console.log('scraping zillow has finished')),
-    scrapeMovoto().then(() => console.log('scraping movoto has finished')),
-    scrapeColdwellbankerhomes().then(() => console.log('scraping Coldwellbankerhomes has finished')),
-    scrapeRemax().then(() => console.log('scraping Remax has finished')),
-    scrapeHomes().then(() => console.log('scraping Homes has finished')),
-    scrapeTrulia().then(() => console.log('scraping Trulia has finished')),
-    scrapeRedfin().then(() => console.log('scraping Redfin has finished'))
+    // scrapeMovoto().then(() => console.log('scraping movoto has finished')),
+    // scrapeColdwellbankerhomes().then(() => console.log('scraping Coldwellbankerhomes has finished')),
+    // scrapeRemax().then(() => console.log('scraping Remax has finished')),
+    // scrapeHomes().then(() => console.log('scraping Homes has finished')),
+    // scrapeTrulia().then(() => console.log('scraping Trulia has finished')),
+    // scrapeRedfin().then(() => console.log('scraping Redfin has finished'))
   ]).then(results => {
     console.log('All scraping jobs settled.');
 

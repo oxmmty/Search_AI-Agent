@@ -1,10 +1,8 @@
-require('dotenv').config();
-
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
-const { z } = require('zod');
 
-const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords');
+const { runWithConcurrency, processSourcesToTags, tagListing, autoScroll, cleanNum, joinUrl } = require('./common');
+const { SALE_TYPE_KEYWORDS, DAMAGE_KEYWORDS_SEARCH } = require('../constants/keywords');
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
@@ -25,9 +23,7 @@ const CITY_PATHS = [
 ];
 
 /** How many listing detail pages to open in parallel */
-const DETAIL_CONCURRENCY = 1;
-/** How many LLM calls in parallel (if using LLM) */
-const TAG_CONCURRENCY = 1;
+const DETAIL_CONCURRENCY = 3;
 
 /* ===================== HEADERS ===================== */
 
@@ -47,25 +43,7 @@ const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 };
 
-/* =================== HELPERS =================== */
 
-function cleanNum(text) {
-  if (!text) return null;
-  const m = /[\d.]+/.exec(text.replace(/,/g, ""));
-  if (!m) return null;
-  const val = Number(m[0]);
-  return Number.isFinite(val) ? Math.trunc(val) : null;
-}
-
-function joinUrl(base, href) {
-  if (!href) return "";
-  if (/^https?:\/\//i.test(href)) return href;
-  return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
-}
-
-/** 
- * https://www.coldwellbankerhomes.com/ga/marietta/keyw-investor/
- * */
 function buildRemarkUrl(cityPath, remark, page) {
   return `${BASE_URL}${cityPath.replace(/\/$/, "")}${page>1 ? `p-${page}` : ''}`;
 }
@@ -76,7 +54,6 @@ function parseCard($, card) {
   const c = $(card);
   const clean = (s = '') => s.replace(/\s+/g, ' ').trim();
 
-  console.log('in card ================');
   // ---------- JSON-LD inside the card ----------
   const safeParse = (txt) => {
     if (!txt) return null;
@@ -213,15 +190,6 @@ function extractRemarksFromHtml(html) {
   return text;
 }
 
-/* ===================== BROWSER HELPERS ===================== */
-
-async function autoScroll(page, { step = 1000, pauseMs = 600, maxSteps = 15 } = {}) {
-  for (let i = 0; i < maxSteps; i++) {
-    await page.evaluate(s => window.scrollBy(0, s), step);
-    await page.waitForTimeout(pauseMs);
-  }
-}
-
 async function fetchListingDescription(context, link) {
   if (!link) return null;
   const page = await context.newPage();
@@ -235,118 +203,6 @@ async function fetchListingDescription(context, link) {
     return null;
   } finally {
     await page.close().catch(() => {});
-  }
-}
-
-async function runWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let i = 0;
-  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) break;
-      results[idx] = await worker(items[idx], idx);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-}
-
-/* ===================== TAGGING ===================== */
-
-const DAMAGE_CANON = DAMAGE_KEYWORDS.map(k => k.toLowerCase());
-const SALE_CANON = SALE_TYPE_KEYWORDS.map(k => k.toLowerCase());
-
-// Lazy-load ESM-only @langchain/openai and cache single instance
-let getLLM;
-{
-  let llmSingleton = null;
-  getLLM = async () => {
-    if (!llmSingleton) {
-      const { ChatOpenAI } = await import('@langchain/openai');
-      llmSingleton = new ChatOpenAI({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        apiKey: process.env.OPENAI_API_KEY || "",
-        temperature: 0
-      });
-    }
-    return llmSingleton;
-  };
-}
-
-/** fast fallback tagging (no LLM required) */
-function heuristicTags(description) {
-  const t = (description || "").toLowerCase();
-  const damage = DAMAGE_CANON.filter(k => t.includes(k));
-  const sale = SALE_CANON.filter(k => t.includes(k));
-  // handle "tlc" variants (normalize)
-  if (/\bneeds\s+tlc\b/i.test(description) && !damage.includes("tlc")) damage.push("tlc");
-  if (/\bneeds\s+tlc\b/i.test(description) && !sale.includes("needs tlc")) sale.push("needs tlc");
-  return {
-    damage_tags: Array.from(new Set(damage)),
-    saletype_tags: Array.from(new Set(sale)),
-  };
-}
-
-/** LLM structured tagging (optional) */
-const ResultSchema = z.object({
-  damage: z.array(z.enum(DAMAGE_CANON)),
-  sale_types: z.array(z.enum(SALE_CANON)),
-  rationale: z.string(),
-});
-
-async function llmTags(description) {
-  const prompt = [
-    { role: "system", content: "Tag real-estate descriptions with exact allowed lowercase keywords only. Prefer high precision." },
-    {
-      role: "user",
-      content: [
-        "ALLOWED DAMAGE:",
-        ...DAMAGE_CANON.map(k => `- ${k}`),
-        "",
-        "ALLOWED SALE TYPES:",
-        ...SALE_CANON.map(k => `- ${k}`),
-        "",
-        "OUTPUT JSON with fields: damage[], sale_types[], rationale",
-        "DESCRIPTION:",
-        description,
-      ].join("\n"),
-    },
-  ];
-  const llm = await getLLM();
-  const out = await llm.withStructuredOutput(ResultSchema).invoke(prompt);
-  const uniq = a => Array.from(new Set(a));
-  return {
-    damage_tags: uniq(out.damage),
-    saletype_tags: uniq(out.sale_types),
-    recommendation: out.rationale,
-  };
-}
-
-async function tagListing(item) {
-  const text = item.description || "";
-  if (!text.trim()) return { ...item, damage_tags: [], saletype_tags: [], recommendation: "No description." };
-
-  if (!process.env.OPENAI_API_KEY) {
-    // heuristic only
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "Heuristic tags (no LLM key provided)." };
-  }
-
-  try {
-    const res = await llmTags(text);
-    // merge in any obvious heuristics that LLM might miss (optional)
-    const h = heuristicTags(text);
-    return {
-      ...item,
-      damage_tags: Array.from(new Set([...res.damage_tags, ...h.damage_tags])),
-      saletype_tags: Array.from(new Set([...res.saletype_tags, ...h.saletype_tags])),
-      recommendation: res.recommendation || "LLM tags",
-    };
-  } catch (e) {
-    console.warn("LLM tagging failed; falling back to heuristic:", (e?.message));
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "" };
   }
 }
 
@@ -366,7 +222,9 @@ async function scrapeSearchPage(context, searchUrl) {
   const page = await context.newPage();
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    console.log(`before waiting url=${searchUrl}`);
     await page.waitForSelector(".search-grid .mvt-cardproperty", { timeout: 45_000 });
+    console.log(`after waiting url=${searchUrl}`);
     await autoScroll(page);
 
     const html = await page.content();
@@ -386,20 +244,22 @@ async function scrapeSearchPages(context, city, term) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    console.log('before waiting');
+    console.log(`before waiting city=${city}, term=${term}, url=${url}`);
     await page.waitForSelector(".search-grid .mvt-cardproperty", { timeout: 45_000 });
-    console.log('after waiting');
+    console.log(`after waiting city=${city}, term=${term}, url=${url}`);
     await autoScroll(page);
 
     const html = await page.content();
     const lastPage = getPageNumber(html);
     console.log(`url=${url}, pages=${lastPage}`)
     const listings = parseSearchHtml(html);
+    console.log(`url=${url}, listings length is = `+listings?.length);
 
     for(let i = 2; i <= lastPage; i++){
-      const results = await scrapeSearchPage(context, buildRemarkUrl(city, term, i)).catch(e => console.log(c));
-      listings.concat(results);
+      const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
+      listings.push(...results);
     }
+    console.log(`url=${url}, total listings length is = `+listings?.length);
 
     return listings;
   } catch (e) {
@@ -414,7 +274,7 @@ async function scrapeAndTagAll(cityPaths) {
   let context = null;
 
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: false });
     context = await browser.newContext({
       userAgent: HEADERS["User-Agent"],
       locale: "en-US",
@@ -424,41 +284,65 @@ async function scrapeAndTagAll(cityPaths) {
     context.setDefaultTimeout(30_000);
     context.setDefaultNavigationTimeout(60_000);
 
-    // 2) scrape each search page
-    const pagesListings = await runWithConcurrency(cityPaths, 3, async ( city ) => {
+    const pagesListings = [];
+    for(const city of cityPaths) {
       const results = await scrapeSearchPages(context, city, "");
+      console.log(`results are ${results}`)
       // attach source term to each
-      return results.map(r => ({ ...r, sources: [term] }));
-    });
+      pagesListings.push(...results.map(r => ({ ...r, sources: [city] })));
+    }
 
-    console.log(pagesListings);
+    console.log(`Total listings found: ${pagesListings.length}`);
 
-    // 3) aggregate + dedupe by link
+    // 3) aggregate + dedupe by link (pagesListings is now a flat array)
     const byLink = new Map();
-    for (const arr of pagesListings) {
-      for (const l of arr) {
-        const existing = byLink.get(l.link);
-        if (existing) {
-          existing.sources = Array.from(new Set([...(existing.sources || []), ...(l.sources || [])]));
-        } else {
-          byLink.set(l.link, l);
-        }
+    for (const listing of pagesListings) {
+      const existing = byLink.get(listing.link);
+      if (existing) {
+        existing.sources = Array.from(new Set([...(existing.sources || []), ...(listing.sources || [])]));
+      } else {
+        byLink.set(listing.link, listing);
       }
     }
     let listings = Array.from(byLink.values());
     console.log(`Found ${listings.length} unique listings across queries.`);
 
-    // 4) enrich: fetch full description for each listing
-    listings = await runWithConcurrency(listings, DETAIL_CONCURRENCY, async (lst) => {
-      const desc = await fetchListingDescription(context, lst.link);
-      return { ...lst, description: desc ?? lst.description ?? null };
-    });
+    // Process listings with concurrency to improve performance
+    listings = await runWithConcurrency(
+      listings,
+      DETAIL_CONCURRENCY,
+      async (listing) => {
+        // Fetch description
+        const desc = await fetchListingDescription(context, listing.link);
+        listing.description = desc ?? listing.description ?? null;
 
-    // 5) tag each listing
-    const tagged = await runWithConcurrency(listings, TAG_CONCURRENCY, tagListing);
+        // Get tags from LLM and sources
+        const llmTags = await tagListing(listing);
+        const sourceTags = processSourcesToTags(listing.sources);
+        
+        // Merge tags from both sources
+        const mergedDamageTags = Array.from(new Set([
+          ...(llmTags.damage_tags || []),
+          ...(sourceTags.damage_tags || [])
+        ]));
+        
+        const mergedSaleTypeTags = Array.from(new Set([
+          ...(llmTags.saletype_tags || []),
+          ...(sourceTags.saletype_tags || [])
+        ]));
+        
+        // Update listing with tags
+        listing.damage_tags = mergedDamageTags;
+        listing.saletype_tags = mergedSaleTypeTags;
+        listing.recommendation = llmTags.recommendation;
+        
+        return listing;
+      }
+    );
 
     // 6) filter: keep only items with at least one tag
-    const filtered = tagged.filter(l => (l.damage_tags.length + l.saletype_tags.length) > 0);
+    const filtered = listings.filter(l => (l.damage_tags.length + l.saletype_tags.length) > 0);
+    console.log(`filtered listings length is = `+filtered?.length);
 
     return filtered;
   } finally {

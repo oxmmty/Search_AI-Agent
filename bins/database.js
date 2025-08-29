@@ -6,9 +6,10 @@ const {
 /**
  * Connect Monogo Database.
  */
+
 mongoose.set('strictQuery', false);
 mongoose
-  .connect(DB_PORT, {
+  .connect(process.env.DB_PORT, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
   })

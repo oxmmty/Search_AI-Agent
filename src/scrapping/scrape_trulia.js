@@ -1,8 +1,8 @@
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
-const { z } = require('zod');
 
-const { DAMAGE_KEYWORDS, SALE_TYPE_KEYWORDS } = require('../constants/keywords');
+const { runWithConcurrency, processSourcesToTags, tagListing, autoScroll, cleanNum, joinUrl } = require('./common');
+const { SALE_TYPE_KEYWORDS, DAMAGE_KEYWORDS_SEARCH } = require('../constants/keywords');
 const Estate = require('../models/estate');
 /* ======================= CONFIG ======================= */
 
@@ -41,21 +41,7 @@ const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 };
 
-/* =================== HELPERS =================== */
 
-function cleanNum(text) {
-  if (!text) return null;
-  const m = /[\d.]+/.exec(text.replace(/,/g, ""));
-  if (!m) return null;
-  const val = Number(m[0]);
-  return Number.isFinite(val) ? Math.trunc(val) : null;
-}
-
-function joinUrl(base, href) {
-  if (!href) return "";
-  if (/^https?:\/\//i.test(href)) return href;
-  return `${base.replace(/\/$/, "")}/${href.replace(/^\//, "")}`;
-}
 
 /** build Trulia search URL like /for_sale/City,ST/<keyword>_keyword */
 function buildRemarkUrl(cityPath, remark, page) {
@@ -208,99 +194,6 @@ async function fetchListingDescription(context, link) {
   }
 }
 
-/* ===================== TAGGING ===================== */
-
-const DAMAGE_CANON = DAMAGE_KEYWORDS.map(k => k.toLowerCase());
-const SALE_CANON = SALE_TYPE_KEYWORDS.map(k => k.toLowerCase());
-
-// Lazy-load ESM-only @langchain/openai and cache single instance
-let getLLM;
-{
-  let llmSingleton = null;
-  getLLM = async () => {
-    if (!llmSingleton) {
-      const { ChatOpenAI } = await import('@langchain/openai');
-      llmSingleton = new ChatOpenAI({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        apiKey: process.env.OPENAI_API_KEY || "",
-        temperature: 0
-      });
-    }
-    return llmSingleton;
-  };
-}
-
-function heuristicTags(description) {
-  const t = (description || "").toLowerCase();
-  const damage = DAMAGE_CANON.filter(k => t.includes(k));
-  const sale = SALE_CANON.filter(k => t.includes(k));
-  if (/\bneeds\s+tlc\b/i.test(description) && !damage.includes("tlc")) damage.push("tlc");
-  if (/\bneeds\s+tlc\b/i.test(description) && !sale.includes("needs tlc")) sale.push("needs tlc");
-  return {
-    damage_tags: Array.from(new Set(damage)),
-    saletype_tags: Array.from(new Set(sale)),
-  };
-}
-
-const ResultSchema = z.object({
-  damage: z.array(z.enum(DAMAGE_CANON)),
-  sale_types: z.array(z.enum(SALE_CANON)),
-  rationale: z.string(),
-});
-
-async function llmTags(description) {
-  const prompt = [
-    { role: "system", content: "Tag real-estate descriptions with exact allowed lowercase keywords only. Prefer high precision." },
-    {
-      role: "user",
-      content: [
-        "ALLOWED DAMAGE:",
-        ...DAMAGE_CANON.map(k => `- ${k}`),
-        "",
-        "ALLOWED SALE TYPES:",
-        ...SALE_CANON.map(k => `- ${k}`),
-        "",
-        "OUTPUT JSON with fields: damage[], sale_types[], rationale",
-        "DESCRIPTION:",
-        description,
-      ].join("\n"),
-    },
-  ];
-  const llm = await getLLM();
-  const out = await llm.withStructuredOutput(ResultSchema).invoke(prompt);
-  const uniq = a => Array.from(new Set(a));
-  return {
-    damage_tags: uniq(out.damage),
-    saletype_tags: uniq(out.sale_types),
-    recommendation: out.rationale,
-  };
-}
-
-async function tagListing(item) {
-  const text = item.description || "";
-  if (!text.trim()) return { ...item, damage_tags: [], saletype_tags: [], recommendation: "No description." };
-
-  if (!process.env.OPENAI_API_KEY) {
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "Heuristic tags (no LLM key provided)." };
-  }
-
-  try {
-    const res = await llmTags(text);
-    const h = heuristicTags(text);
-    return {
-      ...item,
-      damage_tags: Array.from(new Set([...res.damage_tags, ...h.damage_tags])),
-      saletype_tags: Array.from(new Set([...res.saletype_tags, ...h.saletype_tags])),
-      recommendation: res.recommendation || "LLM tags",
-    };
-  } catch (e) {
-    console.warn("LLM tagging failed; falling back to heuristic:", (e?.message));
-    const h = heuristicTags(text);
-    return { ...item, ...h, recommendation: "" };
-  }
-}
-
 /* ===================== SCRAPE + AGGREGATE ===================== */
 
 function getPageNumber(html){
@@ -342,12 +235,12 @@ async function scrapeSearchPages(context, city, term) {
 
     const html = await page.content();
     const lastPage = getPageNumber(html);
-    const listings = parseSearchHtml(html);
+    let listings = parseSearchHtml(html);
 
     console.log(`url=${url}, pages=${lastPage}`)
     for(let i = 2; i <= lastPage; i++){
       const results = scrapeSearchPage(context, buildRemarkUrl(city, term, i));
-      listings.concat(results);
+      listings = [...listings, ...results];
     }
 
     return listings;
