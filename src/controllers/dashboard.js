@@ -48,8 +48,6 @@ const getData = async (req, res) => {
   const estates = await Estate.find(query).skip((page-1)*24).limit(24).catch(e => console.log(e));
   const total = await Estate.countDocuments(query).catch(e => console.log(e));
 
-  console.log(total);
-
   return res.send({
     status: true,
     result: { data: estates, total: total }
