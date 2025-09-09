@@ -20,7 +20,7 @@ app.use(express.urlencoded({ extended: false, limit: '50mb' }));
 app.use(express.static(path.join(__dirname, '../uploads')));
 
 app.get('/health', (req, res) => {
-  res.send('Cool!');
+  res.status(200).send('Cool!');
 });
 app.use('/app', appRouter);
 

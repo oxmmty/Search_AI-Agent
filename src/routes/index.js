@@ -10,4 +10,8 @@ router.use('/auth', auth);
 router.use('/user', checkAuth, user);
 router.use('/dashboard', checkAuth, dashboard);
 
+router.get('/', (req, res) => {
+  res.send('app is running');
+});
+
 module.exports = router;
